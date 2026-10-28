@@ -1,5 +1,4 @@
 const express = require("express");
-const cors = require("cors");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -11,7 +10,21 @@ const pino = require("pino");
 const fs = require("fs");
 
 const app = express();
-app.use(cors());
+
+// बाहेरील 'cors' पॅकेजशिवाय सर्व ब्राउझर रिक्वेस्टना परवानगी देणारा कोड
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-api-key, x-auth-token"
+  );
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
 let sock = null;
@@ -76,7 +89,6 @@ async function startWhatsApp() {
 
 startWhatsApp();
 
-// स्टेटस का डेटा तैयार करने वाला फंक्शन
 function getStatusResponse() {
   return {
     success: true,
@@ -88,17 +100,17 @@ function getStatusResponse() {
   };
 }
 
-// 1. होम और हेल्थ रूट्स
+// 1. होम आणि हेल्थ रूट्स
 app.get("/", (req, res) => res.send("WhatsApp Gateway Server is Live!"));
 app.get("/health", (req, res) => res.json(getStatusResponse()));
 
-// 2. स्टेटस रूट्स (404 एरर ठीक करने के लिए शोरूम ID के साथ और बिना ID के)
+// 2. स्टेटस रूट्स (/session/status/12345678 सह)
 app.get("/session/status", (req, res) => res.json(getStatusResponse()));
 app.get("/session/status/:id", (req, res) => res.json(getStatusResponse()));
 app.get("/status", (req, res) => res.json(getStatusResponse()));
 app.get("/status/:id", (req, res) => res.json(getStatusResponse()));
 
-// 3. कनेक्ट रूट्स (403 एरर ठीक करने के लिए बिना टोकन रुकावट के)
+// 3. कनेक्ट आणि QR रूट्स
 const handleConnect = async (req, res) => {
   if (!isConnected && !qrCodeData) {
     await startWhatsApp();
@@ -107,10 +119,10 @@ const handleConnect = async (req, res) => {
   res.json(getStatusResponse());
 };
 
-app.post("/session/connect", handleConnect);
-app.post("/session/connect/:id", handleConnect);
-app.get("/session/connect", handleConnect);
-app.get("/session/connect/:id", handleConnect);
+app.all("/session/connect", handleConnect);
+app.all("/session/connect/:id", handleConnect);
+app.all("/connect", handleConnect);
+app.all("/connect/:id", handleConnect);
 
 // 4. डिस्कनेक्ट रूट्स
 const handleDisconnect = async (req, res) => {
@@ -126,10 +138,10 @@ const handleDisconnect = async (req, res) => {
   res.json({ success: true, status: "disconnected", connected: false });
 };
 
-app.post("/session/disconnect", handleDisconnect);
-app.post("/session/disconnect/:id", handleDisconnect);
+app.all("/session/disconnect", handleDisconnect);
+app.all("/session/disconnect/:id", handleDisconnect);
 
-// 5. मैसेज भेजने का रूट
+// 5. मेसेज पाठवण्याचे रूट्स
 const handleSendMessage = async (req, res) => {
   try {
     if (!isConnected || !sock) {
