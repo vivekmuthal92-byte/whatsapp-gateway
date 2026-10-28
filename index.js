@@ -11,12 +11,13 @@ const fs = require("fs");
 
 const app = express();
 
-// बाहेरील 'cors' पॅकेजशिवाय सर्व ब्राउझर रिक्वेस्टना परवानगी देणारा कोड
+// x-showroom-id आणि इतर सर्व ब्राउझर हेडर्सना परवानगी देणारा सुधारित कोड
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-api-key, x-auth-token"
+    req.headers["access-control-request-headers"] ||
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-api-key, x-auth-token, x-showroom-id"
   );
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   if (req.method === "OPTIONS") {
@@ -78,6 +79,7 @@ async function startWhatsApp() {
           if (fs.existsSync("./auth_info")) {
             fs.rmSync("./auth_info", { recursive: true, force: true });
           }
+          setTimeout(startWhatsApp, 2000);
         }
       }
     });
@@ -104,7 +106,7 @@ function getStatusResponse() {
 app.get("/", (req, res) => res.send("WhatsApp Gateway Server is Live!"));
 app.get("/health", (req, res) => res.json(getStatusResponse()));
 
-// 2. स्टेटस रूट्स (/session/status/12345678 सह)
+// 2. स्टेटस रूट्स
 app.get("/session/status", (req, res) => res.json(getStatusResponse()));
 app.get("/session/status/:id", (req, res) => res.json(getStatusResponse()));
 app.get("/status", (req, res) => res.json(getStatusResponse()));
