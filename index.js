@@ -11,7 +11,7 @@ const fs = require("fs");
 
 const app = express();
 
-// x-showroom-id आणि इतर सर्व ब्राउझर हेडर्सना परवानगी देणारा सुधारित कोड
+// सर्व हेडर्स आणि CORS परवानग्या देणारा कोड
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header(
@@ -106,13 +106,13 @@ function getStatusResponse() {
 app.get("/", (req, res) => res.send("WhatsApp Gateway Server is Live!"));
 app.get("/health", (req, res) => res.json(getStatusResponse()));
 
-// 2. स्टेटस रूट्स
+// 2. सर्व प्रकारच्या स्टेटस तपासण्याच्या विनंत्यांसाठी
 app.get("/session/status", (req, res) => res.json(getStatusResponse()));
 app.get("/session/status/:id", (req, res) => res.json(getStatusResponse()));
 app.get("/status", (req, res) => res.json(getStatusResponse()));
 app.get("/status/:id", (req, res) => res.json(getStatusResponse()));
 
-// 3. कनेक्ट आणि QR रूट्स
+// 3. कनेक्ट करण्यासाठीचे रूट्स
 const handleConnect = async (req, res) => {
   if (!isConnected && !qrCodeData) {
     await startWhatsApp();
@@ -126,7 +126,7 @@ app.all("/session/connect/:id", handleConnect);
 app.all("/connect", handleConnect);
 app.all("/connect/:id", handleConnect);
 
-// 4. डिस्कनेक्ट रूट्स
+// 4. डिस्कनेक्ट करण्यासाठीचे रूट्स
 const handleDisconnect = async (req, res) => {
   try {
     if (sock) await sock.logout();
@@ -143,30 +143,39 @@ const handleDisconnect = async (req, res) => {
 app.all("/session/disconnect", handleDisconnect);
 app.all("/session/disconnect/:id", handleDisconnect);
 
-// 5. मेसेज पाठवण्याचे रूट्स
+// 5. मेसेज पाठवण्यासाठीचे मुख्य रूट्स (JSON फॉरमॅटमध्ये खात्रीशीर उत्तर)
 const handleSendMessage = async (req, res) => {
   try {
     if (!isConnected || !sock) {
-      return res.status(400).json({ success: false, error: "WhatsApp not connected" });
+      return res.status(200).json({ 
+        success: false, 
+        error: "WhatsApp session is NOT CONNECTED. Reconnect your WhatsApp session before transmitting messages." 
+      });
     }
+    
     const { phone, number, to, message, text } = req.body;
     const rawNumber = phone || number || to;
     const msgText = message || text;
+
+    if (!rawNumber || !msgText) {
+      return res.status(200).json({ success: false, error: "Phone number and message are required" });
+    }
 
     let cleanNumber = String(rawNumber).replace(/\D/g, "");
     if (cleanNumber.length === 10) cleanNumber = "91" + cleanNumber;
     const jid = `${cleanNumber}@s.whatsapp.net`;
 
     await sock.sendMessage(jid, { text: msgText });
-    res.json({ success: true, message: "Message sent" });
+    res.json({ success: true, message: "Message sent successfully" });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(200).json({ success: false, error: err.message });
   }
 };
 
 app.post("/send-message", handleSendMessage);
 app.post("/session/send", handleSendMessage);
 app.post("/session/send/:id", handleSendMessage);
+app.post("/api/send", handleSendMessage);
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
