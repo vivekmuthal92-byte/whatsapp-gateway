@@ -14,6 +14,7 @@ const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
 const admin = require("firebase-admin");
+const { handleIncoming } = require("./handleIncoming");
 
 const app = express();
 
@@ -190,6 +191,8 @@ function statusOf(id) {
   };
 }
 
+const seenMessages = new Set();
+
 async function forwardIncoming(id, m) {
   try {
     if (!m.message || m.key.fromMe) return;
@@ -201,6 +204,20 @@ async function forwardIncoming(id, m) {
       (m.message.imageMessage && m.message.imageMessage.caption) ||
       "";
     if (!text) return;
+    // Firestore उपलब्ध असेल तर थेट साठवा आणि Gemini रिप्लाय पाठवा (पोर्टल वेबहुक नको)
+    if (db) {
+      const dk = `${id}:${m.key.id}`;
+      if (seenMessages.has(dk)) return;
+      seenMessages.add(dk);
+      if (seenMessages.size > 2000) seenMessages.delete(seenMessages.values().next().value);
+      const result = await handleIncoming(db, id, jid.split("@")[0], jid, jid.endsWith("@lid"), text, m.pushName || "");
+      console.log(`[${id}] Saved to Firestore. conv:`, result && result.conversationId, "| reply:", result && result.replyText ? "yes" : "no");
+      if (result && result.replyText) {
+        const ss = sessions.get(id);
+        if (ss && ss.connected && ss.sock) await ss.sock.sendMessage(jid, { text: result.replyText });
+      }
+      return;
+    }
     if (!PORTAL_WEBHOOK_URL || !WEBHOOK_SECRET) {
       console.log(`[${id}] Webhook env missing (PORTAL_WEBHOOK_URL / WHATSAPP_WEBHOOK_SECRET)`);
       return;
@@ -223,7 +240,13 @@ async function forwardIncoming(id, m) {
       }),
     });
     clearTimeout(t);
-    console.log(`[${id}] Incoming forwarded, status:`, resp.status);
+    const ct = resp.headers.get("content-type") || "";
+    let body = "";
+    try { body = (await resp.text()).slice(0, 120).replace(/\s+/g, " "); } catch (e) {}
+    console.log(`[${id}] Incoming forwarded, status:`, resp.status, "| type:", ct, "| body:", body);
+    if (ct.includes("text/html")) {
+      console.log(`[${id}] WARNING: portal returned an HTML page, not the webhook. PORTAL_WEBHOOK_URL is probably the Preview URL (ais-pre). Use the Production run.app URL.`);
+    }
   } catch (e) {
     console.error(`[${id}] forward error:`, e.message);
   }
