@@ -1,5 +1,4 @@
-
-const admin = require("firebase-admin");
+ const admin = require("firebase-admin");
 const { GoogleGenAI } = require("@google/genai");
 
 // 10 अंकी भारतीय फोन नंबर स्वच्छ करणे (91 वगळणे)
@@ -254,9 +253,9 @@ ${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उप
 
         const ai = new GoogleGenAI({ apiKey });
         const geminiRes = await ai.models.generateContent({
-          model: aiConfig.preferredModel || process.env.GEMINI_MODEL || "gemini-2.5-flash",
+          model: aiConfig.preferredModel || process.env.GEMINI_MODEL || "gemini-3.8-flash",
           contents: prompt,
-          config: { systemInstruction, temperature: 0.2 },
+          config: { systemInstruction },
         });
 
         replyText = (geminiRes.text || "").trim();
