@@ -5,6 +5,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   initAuthCreds,
+  makeCacheableSignalKeyStore,
   BufferJSON,
   proto,
 } = require("@whiskeysockets/baileys");
@@ -247,10 +248,14 @@ async function startWhatsApp(id) {
       version = undefined;
     }
 
+    const waLogger = pino({ level: "silent" });
     const sock = makeWASocket({
       ...(version ? { version } : {}),
-      auth: state,
-      logger: pino({ level: "silent" }),
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, waLogger),
+      },
+      logger: waLogger,
       browser: ["Vihaan Automation", "Chrome", "1.0.0"],
     });
     s.sock = sock;
