@@ -1,4 +1,5 @@
- const express = require("express");
+
+const express = require("express");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -14,6 +15,7 @@ const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
 const admin = require("firebase-admin");
+const { getFirestore } = require("firebase-admin/firestore");
 const { handleIncoming } = require("./handleIncoming");
 
 const app = express();
@@ -34,7 +36,9 @@ try {
     const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, "\n");
     admin.initializeApp({ credential: admin.credential.cert(sa) });
-    db = admin.firestore();
+    const dbId = (process.env.FIRESTORE_DATABASE_ID || "").trim();
+    db = dbId ? getFirestore(admin.app(), dbId) : admin.firestore();
+    console.log("Firestore database:", dbId || "(default)");
     console.log("Firebase connected: sessions will be stored in Firestore (wa_sessions)");
   } else {
     console.log("WARNING: FIREBASE_SERVICE_ACCOUNT missing. Using local disk (sessions will be LOST on restart).");
