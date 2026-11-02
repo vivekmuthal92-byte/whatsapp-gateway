@@ -8,7 +8,16 @@ function extractLast10Digits(raw) {
   return digits.length >= 10 ? digits.slice(-10) : digits;
 }
 
-async function handleIncoming(db, showroomId, from, jid, isLid, text, name) {
+async function handleIncoming(db, showroomId, from, jid, isLid, text, name, sendReply) {
+  const T0 = Date.now();
+  const lap = {};
+  // AI सेटिंग, शोरूम आणि गाड्या आधीच (समांतर) वाचायला सुरू करा, म्हणजे वेळ वाचतो
+  const aiPromise = Promise.all([
+    db.collection("showrooms").doc(showroomId).collection("aiSettings").doc("config").get(),
+    db.collection("showrooms").doc(showroomId).get(),
+    db.collection("showrooms").doc(showroomId).collection("vehicles").get(),
+  ]);
+  aiPromise.catch(() => {});
   const now = new Date();
   const nowIso = now.toISOString();
   const messageId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -181,13 +190,10 @@ async function handleIncoming(db, showroomId, from, jid, isLid, text, name) {
   await targetConvRef.collection("messages").doc(messageId).set(incomingMsgPayload, { merge: true });
 
   console.log(`[Firestore Saved] Incoming: showrooms/${showroomId}/conversations/${conversationId}/messages/${messageId}`);
+  lap.saved = Date.now() - T0;
 
   // ७. AI Settings आणि Mode
-  const [aiSnap, showroomSnap, vehiclesSnap] = await Promise.all([
-    db.collection("showrooms").doc(showroomId).collection("aiSettings").doc("config").get(),
-    db.collection("showrooms").doc(showroomId).get(),
-    db.collection("showrooms").doc(showroomId).collection("vehicles").get(),
-  ]);
+  const [aiSnap, showroomSnap, vehiclesSnap] = await aiPromise;
 
   const aiConfig = aiSnap.exists ? aiSnap.data() : {};
   const showroomData = showroomSnap.exists ? showroomSnap.data() : {};
@@ -204,6 +210,7 @@ async function handleIncoming(db, showroomId, from, jid, isLid, text, name) {
     !humanTakeover;
 
   let replyText = null;
+  let replySent = false;
 
   // ८. Mode C: Gemini रिप्लाय
   if (isModeC) {
@@ -258,29 +265,47 @@ ${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उप
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
         // 503/429 (Gemini व्यस्त) आल्यास पुन्हा प्रयत्न करा, मग पर्यायी मॉडेल
-        const tries = [primaryModel, primaryModel, primaryModel];
-        if (fallbackModel && fallbackModel !== primaryModel) tries.push(fallbackModel);
+        // आधी मुख्य मॉडेल, लगेच पर्यायी मॉडेल, मग शेवटचा प्रयत्न. प्रत्येक प्रयत्नाला कमाल वेळ मर्यादा आहे.
+        const tries =
+          fallbackModel && fallbackModel !== primaryModel
+            ? [primaryModel, fallbackModel, primaryModel]
+            : [primaryModel, primaryModel];
+        const ATTEMPT_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 7000);
+        const withTimeout = (promise) =>
+          Promise.race([
+            promise,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error(`Gemini timeout after ${ATTEMPT_TIMEOUT_MS}ms (503 high demand)`)), ATTEMPT_TIMEOUT_MS)
+            ),
+          ]);
         let lastErr = null;
         let geminiRes = null;
         for (let i = 0; i < tries.length; i++) {
           try {
-            geminiRes = await ai.models.generateContent({
-              model: tries[i],
-              contents: prompt,
-              config: { systemInstruction },
-            });
+            geminiRes = await withTimeout(
+              ai.models.generateContent({
+                model: tries[i],
+                contents: prompt,
+                config: { systemInstruction },
+              })
+            );
             lastErr = null;
             break;
           } catch (err) {
             lastErr = err;
             console.error(`[Gemini] attempt ${i + 1} (${tries[i]}) failed:`, String(err.message || err).slice(0, 160));
             if (!isBusy(err)) break;
-            await sleep(1500 * (i + 1));
+            await sleep(300);
           }
         }
         if (lastErr) throw lastErr;
 
         replyText = (geminiRes.text || "").trim();
+        lap.gemini = Date.now() - T0;
+        // रिप्लाय आधी WhatsApp वर पाठवा, साठवणं नंतर
+        if (replyText && sendReply) {
+          try { await sendReply(replyText); replySent = true; } catch (e) { console.error("[sendReply]", e.message); }
+        }
 
         if (replyText) {
           // ९. रिप्लाय त्याच चॅटमध्ये outgoing म्हणून साठवणे
@@ -326,6 +351,9 @@ ${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उप
         // Gemini अपयशी ठरल्यास ग्राहकाला उत्तराशिवाय सोडू नका
         if (process.env.GEMINI_FAILURE_REPLY !== "off") {
           replyText = process.env.GEMINI_FAILURE_REPLY || "आमचा प्रतिनिधी लवकरच संपर्क करेल";
+          if (sendReply) {
+            try { await sendReply(replyText); replySent = true; } catch (e) { console.error("[sendReply]", e.message); }
+          }
           const fbId = `msg_ai_${Date.now()}`;
           await targetConvRef.collection("messages").doc(fbId).set({
             id: fbId, messageId: fbId, conversationId, showroomId,
@@ -350,7 +378,8 @@ ${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उप
     await targetConvRef.set({ replyStatus: "pending", pendingReplyNote: "उत्तर देणे बाकी" }, { merge: true });
   }
 
-  return { success: true, conversationId, leadId: resolvedLeadId, replyText };
+  console.log(`[timing] showroom=${showroomId} incoming-saved=${lap.saved}ms gemini-done=${lap.gemini || "-"}ms total=${Date.now() - T0}ms`);
+  return { success: true, conversationId, leadId: resolvedLeadId, replyText, replySent };
 }
 
 module.exports = { handleIncoming };
