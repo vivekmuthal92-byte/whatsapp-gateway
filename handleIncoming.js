@@ -252,11 +252,33 @@ ${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उप
 थेट WhatsApp उत्तर लिही:`;
 
         const ai = new GoogleGenAI({ apiKey });
-        const geminiRes = await ai.models.generateContent({
-          model: aiConfig.preferredModel || process.env.GEMINI_MODEL || "gemini-3.8-flash",
-          contents: prompt,
-          config: { systemInstruction },
-        });
+        const primaryModel = aiConfig.preferredModel || process.env.GEMINI_MODEL || "gemini-3.8-flash";
+        const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || "";
+        const isBusy = (e) => /503|429|500|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand/i.test(String((e && e.message) || e));
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        // 503/429 (Gemini व्यस्त) आल्यास पुन्हा प्रयत्न करा, मग पर्यायी मॉडेल
+        const tries = [primaryModel, primaryModel, primaryModel];
+        if (fallbackModel && fallbackModel !== primaryModel) tries.push(fallbackModel);
+        let lastErr = null;
+        let geminiRes = null;
+        for (let i = 0; i < tries.length; i++) {
+          try {
+            geminiRes = await ai.models.generateContent({
+              model: tries[i],
+              contents: prompt,
+              config: { systemInstruction },
+            });
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.error(`[Gemini] attempt ${i + 1} (${tries[i]}) failed:`, String(err.message || err).slice(0, 160));
+            if (!isBusy(err)) break;
+            await sleep(1500 * (i + 1));
+          }
+        }
+        if (lastErr) throw lastErr;
 
         replyText = (geminiRes.text || "").trim();
 
@@ -301,6 +323,27 @@ ${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उप
         }
       } catch (geminiErr) {
         console.error("[Gemini Auto-Reply Error]:", geminiErr.message);
+        // Gemini अपयशी ठरल्यास ग्राहकाला उत्तराशिवाय सोडू नका
+        if (process.env.GEMINI_FAILURE_REPLY !== "off") {
+          replyText = process.env.GEMINI_FAILURE_REPLY || "आमचा प्रतिनिधी लवकरच संपर्क करेल";
+          const fbId = `msg_ai_${Date.now()}`;
+          await targetConvRef.collection("messages").doc(fbId).set({
+            id: fbId, messageId: fbId, conversationId, showroomId,
+            direction: "outgoing", text: replyText, content: replyText,
+            status: "sent", sender: "ai_bot", senderName: "Auto-reply",
+            from: canonicalCustomerId, customerPhone: canonicalCustomerId, customerName,
+            jid: resolvedTargetJid, isLid: isLidMode, customerId: canonicalCustomerId,
+            leadId: resolvedLeadId, type: "text",
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            createdAt: new Date().toISOString(),
+          }, { merge: true });
+          await targetConvRef.set({
+            lastMessage: replyText, lastMessageText: replyText,
+            lastMessageAt: new Date().toISOString(),
+            lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+            replyStatus: "replied",
+          }, { merge: true });
+        }
       }
     }
   } else {
