@@ -1,473 +1,523 @@
-
-const express = require("express");
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  initAuthCreds,
-  makeCacheableSignalKeyStore,
-  BufferJSON,
-  proto,
-} = require("@whiskeysockets/baileys");
-const QRCode = require("qrcode");
-const pino = require("pino");
-const fs = require("fs");
-const path = require("path");
 const admin = require("firebase-admin");
-const { getFirestore } = require("firebase-admin/firestore");
-const { handleIncoming } = require("./handleIncoming");
+const { GoogleGenAI } = require("@google/genai");
 
-const app = express();
+// ---------- सेटिंग्ज (Render Environment मधून बदलता येतात) ----------
+const MAX_AI_REPLIES_PER_DAY = Number(process.env.MAX_AI_REPLIES_PER_DAY || 40);
+const ATTEMPT_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 7000);
+const HANDOFF_REPLY = process.env.HANDOFF_REPLY || "ठीक आहे, आमचा प्रतिनिधी लवकरच तुम्हाला संपर्क करेल.";
+// ग्राहकाला माणसाशी बोलायचं असल्याचे शब्द
+const HUMAN_RE = /(\bcall\b|कॉल|फोन करा|फोन कर|\bmanager\b|मॅनेजर|मालक|\bowner\b|तक्रार|complaint|\bhuman\b|माणसाशी|बोलायचं|बोलायचे|बोलायचंय|speak to|talk to)/i;
 
-const AUTH_ROOT = process.env.AUTH_DIR || "./auth_info";
-const PORTAL_WEBHOOK_URL = process.env.PORTAL_WEBHOOK_URL || "";
-const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || "";
-const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || ""; // पर्यायी
-const MAX_RETRIES = 3;
-
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e && e.message));
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e && e.message));
-
-// ---------- Firebase (सत्रे Firestore मध्ये साठवली जातात) ----------
-let db = null;
-try {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, "\n");
-    admin.initializeApp({ credential: admin.credential.cert(sa) });
-    const dbId = (process.env.FIRESTORE_DATABASE_ID || "").trim();
-    db = dbId ? getFirestore(admin.app(), dbId) : admin.firestore();
-    console.log("Firestore database:", dbId || "(default)");
-    console.log("Firebase connected: sessions will be stored in Firestore (wa_sessions)");
-  } else {
-    console.log("WARNING: FIREBASE_SERVICE_ACCOUNT missing. Using local disk (sessions will be LOST on restart).");
+const dailyCounts = new Map();
+function overDailyCap(convId) {
+  const day = new Date().toISOString().slice(0, 10);
+  const e = dailyCounts.get(convId);
+  if (!e || e.day !== day) {
+    dailyCounts.set(convId, { day, count: 0 });
+    return false;
   }
-} catch (e) {
-  console.error("Firebase init error:", e.message);
-  db = null;
+  return e.count >= MAX_AI_REPLIES_PER_DAY;
+}
+function bumpDaily(convId) {
+  const e = dailyCounts.get(convId);
+  if (e) e.count += 1;
 }
 
-const SESSIONS_COL = "wa_sessions";
-
-function safeKey(k) {
-  return String(k).replace(/\//g, "__").replace(/:/g, "-");
+// 10 अंकी भारतीय फोन नंबर स्वच्छ करणे (91 वगळणे)
+function extractLast10Digits(raw) {
+  const withoutDomain = String(raw || "").trim().replace(/@.*$/, "");
+  const digits = withoutDomain.replace(/\D/g, "");
+  return digits.length >= 10 ? digits.slice(-10) : digits;
 }
 
-async function useFirestoreAuthState(id) {
-  const col = db.collection(SESSIONS_COL).doc(id).collection("data");
-  const write = (key, val) =>
-    col.doc(safeKey(key)).set({ v: JSON.stringify(val, BufferJSON.replacer) });
-  const read = async (key) => {
-    const d = await col.doc(safeKey(key)).get();
-    return d.exists ? JSON.parse(d.data().v, BufferJSON.reviver) : null;
-  };
-  const remove = (key) => col.doc(safeKey(key)).delete();
+// ===================================================================
+// भाग १: येणारा मेसेज साठवणे (लगेच, AI शिवाय)
+// ===================================================================
+async function saveIncoming(db, showroomId, from, jid, isLid, text, name, opts) {
+  const kind = (opts && opts.type) || "text";
+  const nowIso = new Date().toISOString();
+  const messageId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
-  const creds = (await read("creds")) || initAuthCreds();
-
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const data = {};
-          await Promise.all(
-            ids.map(async (i) => {
-              let v = await read(`${type}-${i}`);
-              if (type === "app-state-sync-key" && v) {
-                v = proto.Message.AppStateSyncKeyData.fromObject(v);
-              }
-              data[i] = v;
-            })
-          );
-          return data;
-        },
-        set: async (data) => {
-          const tasks = [];
-          for (const type in data) {
-            for (const i in data[type]) {
-              const v = data[type][i];
-              const k = `${type}-${i}`;
-              tasks.push(v ? write(k, v) : remove(k));
-            }
-          }
-          await Promise.all(tasks);
-        },
-      },
-    },
-    saveCreds: async () => {
-      await write("creds", creds);
-      await db.collection(SESSIONS_COL).doc(id).set(
-        { updatedAt: Date.now() },
-        { merge: true }
-      );
-    },
-  };
-}
-
-// CORS
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Headers",
-    req.headers["access-control-request-headers"] ||
-      "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-api-key, x-auth-token, x-showroom-id"
+  const isLidMode = Boolean(
+    isLid === true || String(jid || "").endsWith("@lid") || String(from || "").endsWith("@lid")
   );
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
+  const normalizedPhone10 = isLidMode ? "" : extractLast10Digits(from);
+  const resolvedTargetJid = isLidMode
+    ? jid || from
+    : jid || (normalizedPhone10 ? `91${normalizedPhone10}@s.whatsapp.net` : from);
+  const canonicalCustomerId = isLidMode ? resolvedTargetJid : normalizedPhone10 || from;
+  const customerName = name && name.trim() ? name.trim() : canonicalCustomerId;
 
-app.use(express.json({ limit: "1mb" }));
-
-// पर्यायी: GATEWAY_API_KEY सेट केली असेल तरच चालते
-app.use((req, res, next) => {
-  if (!GATEWAY_API_KEY) return next();
-  if (req.path === "/" || req.path === "/health") return next();
-  const k = req.headers["x-api-key"] || (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (k === GATEWAY_API_KEY) return next();
-  return res.status(401).json({ success: false, error: "Unauthorized" });
-});
-
-// ---------- शोरूमनुसार वेगळी सत्रे ----------
-const sessions = new Map();
-
-function validId(id) {
-  return typeof id === "string" && /^[A-Za-z0-9_-]{3,40}$/.test(id);
-}
-
-function getShowroomId(req) {
-  return String(
-    req.params.id ||
-      req.headers["x-showroom-id"] ||
-      req.query.showroomId ||
-      (req.body && req.body.showroomId) ||
-      ""
-  ).trim();
-}
-
-function getSession(id) {
-  if (!sessions.has(id)) {
-    sessions.set(id, {
-      id, sock: null, qr: null, connected: false, connecting: false,
-      retries: 0, phone: null, error: null, stopped: false,
-    });
-  }
-  return sessions.get(id);
-}
-
-async function clearAuth(id) {
-  if (!validId(id)) return;
-  try {
-    if (db) {
-      await db.recursiveDelete(db.collection(SESSIONS_COL).doc(id));
+  // विद्यमान Lead शोधणे
+  const leadsRef = db.collection("showrooms").doc(showroomId).collection("leads");
+  const leadsSnap = await leadsRef.get();
+  let matchedLeadId = null;
+  let matchedLeadData = null;
+  leadsSnap.forEach((docSnap) => {
+    if (matchedLeadId) return;
+    const d = docSnap.data() || {};
+    const dJid = String(d.jid || "").trim();
+    const dPhone = String(d.phone || d.customerPhone || "").trim();
+    if (isLidMode) {
+      if (resolvedTargetJid && (dJid === resolvedTargetJid || dPhone === resolvedTargetJid || docSnap.id === resolvedTargetJid)) {
+        matchedLeadId = docSnap.id;
+        matchedLeadData = d;
+      }
     } else {
-      const dir = path.join(AUTH_ROOT, id);
-      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+      const dPhone10 = extractLast10Digits(dPhone);
+      if (normalizedPhone10 && dPhone10 && dPhone10 === normalizedPhone10) {
+        matchedLeadId = docSnap.id;
+        matchedLeadData = d;
+      }
     }
-  } catch (e) {
-    console.error(`[${id}] clearAuth error:`, e.message);
-  }
-}
+  });
 
-function statusOf(id) {
-  const s = id ? sessions.get(id) : null;
-  const connected = !!(s && s.connected);
-  const qr = s && !connected ? s.qr : null;
-  const status = connected
-    ? "connected"
-    : qr
-    ? "qr"
-    : s && s.connecting
-    ? "connecting"
-    : "disconnected";
+  // Lead नसेल तर नवीन Lead
+  let resolvedLeadId = matchedLeadId;
+  if (!resolvedLeadId) {
+    resolvedLeadId = `LEAD-${showroomId}-${Date.now().toString().slice(-5)}`;
+    await leadsRef.doc(resolvedLeadId).set(
+      {
+        leadId: resolvedLeadId,
+        showroomId,
+        name: customerName,
+        phone: canonicalCustomerId,
+        customerPhone: canonicalCustomerId,
+        customerId: canonicalCustomerId,
+        jid: resolvedTargetJid,
+        isLid: isLidMode,
+        email: "",
+        aadhaarPan: "NOT_PROVIDED",
+        budgetINR: "₹1,00,000",
+        interest: "WhatsApp Inquiry",
+        preferredCategory: "two_wheeler",
+        interestedModels: ["WhatsApp Inquiry"],
+        leadSource: "WhatsApp",
+        assignedStaff: "Sales Advisor",
+        assignedAdvisor: "Sales Advisor",
+        followUpDate: new Date(Date.now() + 86400000).toISOString(),
+        notes: `Auto-created from incoming WhatsApp message: "${text}"`,
+        stage: "New Lead",
+        purchaseStatus: "Undecided",
+        status: "New Lead",
+        quotationIds: [],
+        exchange: null,
+        documents: [],
+        schedules: [],
+        activities: [
+          {
+            id: `ACT-${Date.now()}`,
+            timestamp: nowIso,
+            type: "note",
+            description: `Incoming WhatsApp message: "${text}"`,
+            authorRole: "sales",
+            authorName: customerName,
+          },
+        ],
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      { merge: true }
+    );
+  }
+
+  // Conversation शोधणे / बनवणे
+  const convsRef = db.collection("showrooms").doc(showroomId).collection("conversations");
+  const convsSnap = await convsRef.get();
+  let matchedConvId = null;
+  convsSnap.forEach((docSnap) => {
+    if (matchedConvId) return;
+    const d = docSnap.data() || {};
+    const dPhone = String(d.customerPhone || d.from || "").trim();
+    const dJid = String(d.jid || "").trim();
+    const dLeadId = String(d.leadId || "").trim();
+    if (isLidMode) {
+      if (resolvedTargetJid && (dJid === resolvedTargetJid || dPhone === resolvedTargetJid)) matchedConvId = docSnap.id;
+    } else if (normalizedPhone10 && extractLast10Digits(dPhone) === normalizedPhone10) {
+      matchedConvId = docSnap.id;
+    }
+    if (resolvedLeadId && (dLeadId === resolvedLeadId || docSnap.id === `conv_${showroomId}_${resolvedLeadId}`)) {
+      matchedConvId = docSnap.id;
+    }
+  });
+
+  const conversationId = matchedConvId || `conv_${showroomId}_${resolvedLeadId}`;
+  const convRef = convsRef.doc(conversationId);
+  const convDocSnap = await convRef.get();
+  const existingConv = convDocSnap.exists ? convDocSnap.data() || {} : {};
+  const currentUnread = Number(existingConv.unreadCount || 0);
+
+  await convRef.set(
+    {
+      id: conversationId,
+      showroomId,
+      from: canonicalCustomerId,
+      jid: resolvedTargetJid,
+      isLid: isLidMode,
+      customerId: canonicalCustomerId,
+      leadId: resolvedLeadId,
+      leadStage: (matchedLeadData && matchedLeadData.stage) || "New Lead",
+      customerName,
+      customerPhone: canonicalCustomerId,
+      status: "open",
+      unreadCount: currentUnread + 1,
+      lastMessage: text,
+      lastMessageText: text,
+      lastMessageAt: nowIso,
+      lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: nowIso,
+      createdAt: existingConv.createdAt || nowIso,
+    },
+    { merge: true }
+  );
+
+  await convRef.collection("messages").doc(messageId).set(
+    {
+      id: messageId,
+      messageId,
+      conversationId,
+      showroomId,
+      direction: "incoming",
+      text,
+      content: text,
+      status: "delivered",
+      sender: "customer",
+      senderName: customerName,
+      from: canonicalCustomerId,
+      customerPhone: canonicalCustomerId,
+      customerName,
+      jid: resolvedTargetJid,
+      isLid: isLidMode,
+      customerId: canonicalCustomerId,
+      leadId: resolvedLeadId,
+      type: kind,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: nowIso,
+    },
+    { merge: true }
+  );
+
+  console.log(`[Firestore Saved] Incoming: showrooms/${showroomId}/conversations/${conversationId}/messages/${messageId}`);
+
   return {
-    success: true,
-    showroomId: id || null,
-    status,
-    connected,
-    isConnected: connected,
-    qr,
-    qrCode: qr,
-    phone: connected && s.phone ? s.phone : null,
-    error: s && s.error ? s.error : null,
+    showroomId,
+    conversationId,
+    convRef,
+    leadId: resolvedLeadId,
+    messageId,
+    customerName,
+    canonicalCustomerId,
+    resolvedTargetJid,
+    isLidMode,
   };
 }
 
-const seenMessages = new Set();
+// जाणारा मेसेज साठवणे (AI किंवा तयार संदेश)
+async function storeOutgoing(ctx, text, sender, senderName) {
+  const id = `msg_ai_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+  await ctx.convRef.collection("messages").doc(id).set(
+    {
+      id,
+      messageId: id,
+      conversationId: ctx.conversationId,
+      showroomId: ctx.showroomId,
+      direction: "outgoing",
+      text,
+      content: text,
+      status: "sent",
+      sender,
+      senderName,
+      from: ctx.canonicalCustomerId,
+      customerPhone: ctx.canonicalCustomerId,
+      customerName: ctx.customerName,
+      jid: ctx.resolvedTargetJid,
+      isLid: ctx.isLidMode,
+      customerId: ctx.canonicalCustomerId,
+      leadId: ctx.leadId,
+      type: "text",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: new Date().toISOString(),
+    },
+    { merge: true }
+  );
+  await ctx.convRef.set(
+    {
+      lastMessage: text,
+      lastMessageText: text,
+      lastMessageAt: new Date().toISOString(),
+      lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+      replyStatus: "replied",
+      suggestedReply: null,
+    },
+    { merge: true }
+  );
+}
 
-async function forwardIncoming(id, m) {
+// ===================================================================
+// ग्राहकाची माहिती (नाव, मॉडेल, बजेट) संभाषणातून लीडमध्ये भरणे
+// ===================================================================
+async function captureLead(db, ctx, ai, model, historyText, combinedText) {
   try {
-    if (!m.message || m.key.fromMe) return;
-    const jid = m.key.remoteJid || "";
-    if (jid.endsWith("@g.us") || jid === "status@broadcast") return;
-    const text =
-      m.message.conversation ||
-      (m.message.extendedTextMessage && m.message.extendedTextMessage.text) ||
-      (m.message.imageMessage && m.message.imageMessage.caption) ||
-      "";
-    if (!text) return;
-    // Firestore उपलब्ध असेल तर थेट साठवा आणि Gemini रिप्लाय पाठवा (पोर्टल वेबहुक नको)
-    if (db) {
-      const dk = `${id}:${m.key.id}`;
-      if (seenMessages.has(dk)) return;
-      seenMessages.add(dk);
-      if (seenMessages.size > 2000) seenMessages.delete(seenMessages.values().next().value);
-      const result = await handleIncoming(db, id, jid.split("@")[0], jid, jid.endsWith("@lid"), text, m.pushName || "");
-      console.log(`[${id}] Saved to Firestore. conv:`, result && result.conversationId, "| reply:", result && result.replyText ? "yes" : "no");
-      if (result && result.replyText) {
-        const ss = sessions.get(id);
-        if (ss && ss.connected && ss.sock) await ss.sock.sendMessage(jid, { text: result.replyText });
-      }
-      return;
-    }
-    if (!PORTAL_WEBHOOK_URL || !WEBHOOK_SECRET) {
-      console.log(`[${id}] Webhook env missing (PORTAL_WEBHOOK_URL / WHATSAPP_WEBHOOK_SECRET)`);
-      return;
-    }
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 10000);
-    const resp = await fetch(PORTAL_WEBHOOK_URL, {
-      method: "POST",
-      signal: ctrl.signal,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${WEBHOOK_SECRET}` },
-      body: JSON.stringify({
-        showroomId: id, // हे सत्राच्या नावावरून ठरतं, मेसेजमधून नाही
-        from: jid.split("@")[0],
-        jid,
-        isLid: jid.endsWith("@lid"),
-        text,
-        name: m.pushName || "",
-        messageId: m.key.id,
-        timestamp: Number(m.messageTimestamp) || Math.floor(Date.now() / 1000),
-      }),
+    const prompt = `खालील WhatsApp संभाषणातून फक्त ग्राहकाने स्पष्टपणे सांगितलेली माहिती काढ. अंदाज लावू नकोस. नमस्कार किंवा Hi म्हणजे नाव नाही. माहिती नसेल तर रिकामी स्ट्रिंग "" दे.
+फक्त JSON दे: {"name":"","interestedModel":"","budget":""}
+
+${historyText ? historyText + "\n" : ""}ग्राहक: ${combinedText}`;
+    const res = await ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: { responseMimeType: "application/json" },
     });
-    clearTimeout(t);
-    const ct = resp.headers.get("content-type") || "";
-    let body = "";
-    try { body = (await resp.text()).slice(0, 120).replace(/\s+/g, " "); } catch (e) {}
-    console.log(`[${id}] Incoming forwarded, status:`, resp.status, "| type:", ct, "| body:", body);
-    if (ct.includes("text/html")) {
-      console.log(`[${id}] WARNING: portal returned an HTML page, not the webhook. PORTAL_WEBHOOK_URL is probably the Preview URL (ais-pre). Use the Production run.app URL.`);
+    const raw = String(res.text || "").replace(/```json|```/g, "").trim();
+    const x = JSON.parse(raw);
+    const name = String(x.name || "").trim();
+    const mdl = String(x.interestedModel || "").trim();
+    const budget = String(x.budget || "").trim();
+    if (!name && !mdl && !budget) return;
+
+    const leadRef = db.collection("showrooms").doc(ctx.showroomId).collection("leads").doc(ctx.leadId);
+    const cur = ((await leadRef.get()).data()) || {};
+    const upd = {};
+    let nameUpdated = false;
+    if (name && (!cur.name || cur.name === cur.phone || cur.name === ctx.canonicalCustomerId || cur.nameFromChat)) {
+      upd.name = name;
+      upd.nameFromChat = true;
+      nameUpdated = true;
     }
+    if (mdl) {
+      if (!cur.interest || cur.interest === "WhatsApp Inquiry" || cur.interestFromChat) {
+        upd.interest = mdl;
+        upd.interestFromChat = true;
+      }
+      upd.interestedModels = admin.firestore.FieldValue.arrayUnion(mdl);
+    }
+    if (budget && (!cur.budgetINR || cur.budgetINR === "₹1,00,000" || cur.budgetFromChat)) {
+      upd.budgetINR = budget;
+      upd.budgetFromChat = true;
+    }
+    if (Object.keys(upd).length === 0) return;
+    upd.updatedAt = new Date().toISOString();
+    await leadRef.set(upd, { merge: true });
+    if (nameUpdated) await ctx.convRef.set({ customerName: name }, { merge: true });
+    console.log(`[LeadCapture] ${ctx.leadId}:`, JSON.stringify({ name, model: mdl, budget }));
   } catch (e) {
-    console.error(`[${id}] forward error:`, e.message);
+    console.error("[LeadCapture]", e.message);
   }
 }
 
-async function startWhatsApp(id) {
-  if (!validId(id)) return;
-  const s = getSession(id);
-  if (s.connecting || s.connected) return;
-  s.connecting = true;
-  s.stopped = false;
-  s.error = null;
+// ===================================================================
+// भाग २: AI रिप्लाय (बॅचमधील सर्व मेसेज एकत्र वाचून एकच उत्तर)
+// ===================================================================
+async function generateReply(db, ctx, combinedText, excludeIds, sendReply, onThinking) {
+  const T0 = Date.now();
+  const showroomId = ctx.showroomId;
+  const exclude = excludeIds instanceof Set ? excludeIds : new Set(excludeIds || []);
+
+  const aiPromise = Promise.all([
+    db.collection("showrooms").doc(showroomId).collection("aiSettings").doc("config").get(),
+    db.collection("showrooms").doc(showroomId).get(),
+    db.collection("showrooms").doc(showroomId).collection("vehicles").get(),
+    ctx.convRef.get(),
+  ]);
+  aiPromise.catch(() => {});
+  const [aiSnap, showroomSnap, vehiclesSnap, convNowSnap] = await aiPromise;
+
+  const aiConfig = aiSnap.exists ? aiSnap.data() : {};
+  const showroomData = showroomSnap.exists ? showroomSnap.data() : {};
+  const convNow = convNowSnap.exists ? convNowSnap.data() || {} : {};
+
+  const effectiveMode = String(aiConfig.mode || aiConfig.aiMode || showroomData.aiMode || "C_CONTROLLED_AUTOMATION").trim();
+  const isAutomationPaused = Boolean(aiConfig.isAutomationPaused === true);
+  const humanTakeover = Boolean(convNow.humanTakeoverActive === true);
+  const isModeC =
+    (effectiveMode === "C_CONTROLLED_AUTOMATION" || effectiveMode === "auto-reply" || effectiveMode === "auto") &&
+    !isAutomationPaused &&
+    !humanTakeover;
+
+  let replyText = null;
+  let replySent = false;
+  const deliver = async (txt) => {
+    if (sendReply) {
+      try {
+        await sendReply(txt);
+        replySent = true;
+      } catch (e) {
+        console.error("[sendReply]", e.message);
+      }
+    }
+  };
+
+  if (!isModeC) {
+    await ctx.convRef.set({ replyStatus: "pending", pendingReplyNote: "उत्तर देणे बाकी" }, { merge: true });
+    return { success: true, conversationId: ctx.conversationId, leadId: ctx.leadId, replyText: null, replySent: false };
+  }
+
+  // रोजची मर्यादा
+  if (overDailyCap(ctx.conversationId)) {
+    console.log(`[AI] daily cap reached for ${ctx.conversationId}`);
+    await ctx.convRef.set({ needsHuman: true, needsHumanAt: new Date().toISOString() }, { merge: true });
+    return { success: true, conversationId: ctx.conversationId, leadId: ctx.leadId, replyText: null, replySent: false };
+  }
+
+  // माणसाशी बोलायचंय?
+  if (HUMAN_RE.test(combinedText)) {
+    replyText = HANDOFF_REPLY;
+    await deliver(replyText);
+    await storeOutgoing(ctx, replyText, "ai_bot", "Auto-reply");
+    await ctx.convRef.set({ needsHuman: true, needsHumanAt: new Date().toISOString() }, { merge: true });
+    bumpDaily(ctx.conversationId);
+    console.log(`[timing] handoff total=${Date.now() - T0}ms`);
+    return { success: true, conversationId: ctx.conversationId, leadId: ctx.leadId, replyText, replySent };
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    console.log("[Gemini] GEMINI_API_KEY missing in Render environment");
+    return { success: true, conversationId: ctx.conversationId, leadId: ctx.leadId, replyText: null, replySent: false };
+  }
+
+  if (typeof onThinking === "function") Promise.resolve(onThinking()).catch(() => {});
 
   try {
-    const { state, saveCreds } = db
-      ? await useFirestoreAuthState(id)
-      : await useMultiFileAuthState(path.join(AUTH_ROOT, id));
-    let version;
+    const vehicleLines = [];
+    vehiclesSnap.forEach((vDoc) => {
+      const v = vDoc.data() || {};
+      const vName = v.name || v.model;
+      if (vName) {
+        const price = Number(v.priceINR || v.price || 0);
+        const stock = Number(v.stockCount || v.stock || 0);
+        vehicleLines.push(
+          `- ${vName} | किंमत: ${price > 0 ? `₹${price}` : "किंमत उपलब्ध नाही"} | स्टॉक: ${stock > 0 ? `${stock} उपलब्ध` : "चौकशी करा"}`
+        );
+      }
+    });
+
+    const showroomName = showroomData.name || `Showroom ${showroomId}`;
+    const showroomAddress = showroomData.address || showroomData.location || "पत्ता उपलब्ध नाही";
+    const showroomTiming = showroomData.openingHours || "";
+    const mapsLink = showroomData.googleMapsLink || showroomData.mapsLink || showroomData.mapUrl || showroomData.locationUrl || "";
+    const customPrompt = aiConfig.customInstructions || aiConfig.systemPrompt || "";
+
+    // आधीचे संभाषण (संदर्भासाठी)
+    let historyText = "";
+    let hadAssistantBefore = false;
     try {
-      ({ version } = await fetchLatestBaileysVersion());
-    } catch (e) {
-      version = undefined;
-    }
-
-    const waLogger = pino({ level: "silent" });
-    const sock = makeWASocket({
-      ...(version ? { version } : {}),
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, waLogger),
-      },
-      logger: waLogger,
-      browser: ["Vihaan Automation", "Chrome", "1.0.0"],
-    });
-    s.sock = sock;
-
-    sock.ev.on("creds.update", saveCreds);
-
-    sock.ev.on("connection.update", async (update) => {
-      if (s.sock !== sock) return; // जुना socket दुर्लक्षित
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        s.qr = await QRCode.toDataURL(qr);
-        s.connected = false;
-      }
-
-      if (connection === "open") {
-        s.connected = true;
-        s.connecting = false;
-        s.qr = null;
-        s.retries = 0;
-        s.error = null;
-        s.phone = sock.user && sock.user.id ? sock.user.id.split(":")[0].split("@")[0] : null;
-        console.log(`[${id}] WhatsApp Connected Successfully!`);
-      }
-
-      if (connection === "close") {
-        s.connected = false;
-        s.connecting = false;
-        s.qr = null;
-        const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
-          ? lastDisconnect.error.output.statusCode
-          : undefined;
-        console.log(`[${id}] WA connection closed. statusCode:`, code);
-        if (s.stopped) return;
-
-        if (code === DisconnectReason.loggedOut) {
-          await clearAuth(id);
-          s.error = "logged_out";
-          return;
-        }
-        if (s.retries < MAX_RETRIES) {
-          s.retries += 1;
-          setTimeout(() => startWhatsApp(id), 3000 * s.retries);
-        } else {
-          s.error = "connect_failed_" + (code || "unknown");
-          console.log(`[${id}] Retries exhausted:`, s.error);
-        }
-      }
-    });
-
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
-      for (const m of messages) await forwardIncoming(id, m);
-    });
-  } catch (err) {
-    console.error(`[${id}] WhatsApp Error:`, err.message);
-    s.connecting = false;
-    s.error = err.message;
-  }
-}
-
-async function disconnectSession(id) {
-  const s = getSession(id);
-  s.stopped = true;
-  try { if (s.sock) await s.sock.logout(); } catch (e) {}
-  try { if (s.sock && s.sock.end) s.sock.end(undefined); } catch (e) {}
-  s.sock = null;
-  s.connected = false;
-  s.connecting = false;
-  s.qr = null;
-  s.phone = null;
-  s.retries = 0;
-  s.error = null;
-  await clearAuth(id);
-}
-
-// ---------- रूट्स ----------
-app.get("/", (req, res) => res.send("WhatsApp Gateway Server is Live!"));
-app.get("/health", (req, res) => {
-  let connected = 0;
-  sessions.forEach((s) => { if (s.connected) connected++; });
-  res.json({ ok: true, sessions: sessions.size, connected, storage: db ? "firestore" : "disk" });
-});
-
-const handleStatus = (req, res) => {
-  const id = getShowroomId(req);
-  res.json(statusOf(validId(id) ? id : null));
-};
-app.get("/session/status", handleStatus);
-app.get("/session/status/:id", handleStatus);
-app.get("/status", handleStatus);
-app.get("/status/:id", handleStatus);
-
-const handleConnect = async (req, res) => {
-  const id = getShowroomId(req);
-  if (!validId(id)) {
-    return res.status(200).json({ success: false, error: "Valid showroomId required" });
-  }
-  const s = getSession(id);
-  if (!s.connected && !s.qr && !s.connecting) {
-    s.retries = 0;
-    await startWhatsApp(id);
-    await new Promise((r) => setTimeout(r, 2500));
-  }
-  res.json(statusOf(id));
-};
-app.all("/session/connect", handleConnect);
-app.all("/session/connect/:id", handleConnect);
-app.all("/connect", handleConnect);
-app.all("/connect/:id", handleConnect);
-
-const handleDisconnect = async (req, res) => {
-  const id = getShowroomId(req);
-  if (!validId(id)) {
-    return res.status(200).json({ success: false, error: "Valid showroomId required" });
-  }
-  console.log(`[${id}] DISCONNECT called:`, req.method, req.originalUrl);
-  await disconnectSession(id);
-  res.json({ success: true, showroomId: id, status: "disconnected", connected: false });
-};
-app.all("/session/disconnect", handleDisconnect);
-app.all("/session/disconnect/:id", handleDisconnect);
-
-const handleSendMessage = async (req, res) => {
-  try {
-    const id = getShowroomId(req);
-    if (!validId(id)) {
-      return res.status(200).json({ success: false, error: "Valid showroomId required" });
-    }
-    const s = sessions.get(id);
-    if (!s || !s.connected || !s.sock) {
-      return res.status(200).json({
-        success: false,
-        error: "WhatsApp session is NOT CONNECTED. Reconnect your WhatsApp session before transmitting messages.",
+      const hSnap = await ctx.convRef.collection("messages").orderBy("timestamp", "desc").limit(14).get();
+      const rows = [];
+      hSnap.forEach((h) => {
+        const d = h.data() || {};
+        if (exclude.has(d.messageId) || exclude.has(d.id)) return;
+        const t = String(d.text || d.content || "").trim();
+        if (t && rows.length < 8) rows.push((d.direction === "incoming" ? "ग्राहक: " : "सहाय्यक: ") + t);
+        if (t && d.direction !== "incoming") hadAssistantBefore = true;
       });
+      historyText = rows.reverse().join("\n");
+    } catch (hErr) {
+      console.error("[History]", hErr.message);
     }
-    const { phone, number, to, jid: bodyJid, message, text, imageUrl, caption } = req.body || {};
-    const msgText = message || text || caption || "";
 
-    let jid = bodyJid;
-    if (!jid) {
-      const rawNumber = phone || number || to;
-      if (!rawNumber) {
-        return res.status(200).json({ success: false, error: "Phone number (or jid) is required" });
+    const firstReplyNote = hadAssistantBefore
+      ? "यापूर्वी उत्तरे दिलेली आहेत, म्हणून नमस्कार किंवा शोरूमची ओळख अजिबात देऊ नकोस. थेट उत्तर दे."
+      : "हे संभाषणाचे पहिले उत्तर आहे, म्हणून थोडक्यात एकदा नमस्कार कर.";
+
+    const systemInstruction = `तू "${showroomName}" या शोरूमचा अधिकृत WhatsApp सहाय्यक आहेस.
+कडक नियम:
+1. फक्त खाली दिलेल्या याच शोरूमच्या डेटावरून उत्तर दे. दुसऱ्या कोणत्याही शोरूमचा डेटा वापरू नकोस.
+2. ग्राहकाच्या भाषेत अतिशय लहान, नम्र आणि स्पष्ट उत्तर दे (१ ते ३ ओळीत).
+3. जर गाडीची किंमत किंवा ऑफर दिलेल्या डेटा मध्ये नसेल, तर नेमके हेच वाक्य सांग: "आमचा प्रतिनिधी लवकरच संपर्क करेल".
+4. स्वतःहून कोणतीही खोटी किंमत किंवा सूट बनवू नकोस.
+5. शोरूमची वेळ, पत्ता किंवा गूगल मॅप लिंक दिलेली नसेल तर ती कधीही स्वतः बनवू नकोस. तेव्हा नेमके हेच वाक्य सांग: "आमचा प्रतिनिधी लवकरच संपर्क करेल".
+6. ग्राहकाने लोकेशन किंवा पत्ता मागितला आणि गूगल मॅप लिंक दिलेली असेल तर ती लिंक थेट पाठव.
+7. आधीचे संभाषण दिलेले असेल तर त्याचा संदर्भ वापर आणि तोच प्रश्न पुन्हा विचारू नकोस. ${firstReplyNote}
+8. आम्ही २४ तास उत्तर देतो. शोरूमची वेळ, पत्ता किंवा Showroom ID ग्राहकाने विचारल्याशिवाय कधीही सांगू नकोस.
+9. ग्राहक ज्या लिपीत लिहितो (देवनागरी किंवा रोमन अक्षरांत मराठी, हिंदी, इंग्रजी) त्याच भाषेत आणि त्याच लिपीत उत्तर दे.
+10. शक्य असेल तेव्हा उत्तराच्या शेवटी एक छोटा पुढचा प्रश्न विचार (उदा. कोणते मॉडेल हवे, बजेट किती, टेस्ट ड्राइव्ह बुक करू का). एका वेळी फक्त एकच प्रश्न.
+11. उत्तर लहान ठेव (१ ते ३ ओळी). इमोजी फार वापरू नकोस.
+12. ग्राहकाचा संदेश [फोटो], [व्हॉइस मेसेज], [व्हिडिओ], [दस्तऐवज] किंवा [लोकेशन] असा असेल तर सांग की तुला तो पाहता येत नाही, पण प्रतिनिधी पाहून कळवेल, आणि ग्राहकाला काय हवे ते मजकुरात लिहायला सांग.
+13. ग्राहकाने एकापेक्षा जास्त संदेश पाठवले असतील तर सर्वांचे मिळून एकच उत्तर दे.${customPrompt ? `\n14. शोरूमची विशेष सूचना: ${customPrompt}` : ""}`;
+
+    const prompt = `=== शोरूम माहिती ===
+शोरूम: ${showroomName}
+पत्ता: ${showroomAddress}
+वेळ: ${showroomTiming || "उपलब्ध नाही"}
+गूगल मॅप लिंक: ${mapsLink || "उपलब्ध नाही"}
+उपलब्ध गाड्या:
+${vehicleLines.length > 0 ? vehicleLines.join("\n") : "माहिती उपलब्ध नाही."}
+=== समाप्त ===
+
+${historyText ? "=== आधीचे संभाषण ===\n" + historyText + "\n=== समाप्त ===\n\n" : ""}ग्राहकाचे नाव: ${ctx.customerName}
+ग्राहकाचे नवीन संदेश:
+${combinedText}
+थेट WhatsApp उत्तर लिही:`;
+
+    const ai = new GoogleGenAI({ apiKey });
+    const primaryModel = aiConfig.preferredModel || process.env.GEMINI_MODEL || "gemini-3.8-flash";
+    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || "";
+    const isBusy = (e) => /503|429|500|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|timeout/i.test(String((e && e.message) || e));
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const withTimeout = (promise) =>
+      Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`Gemini timeout after ${ATTEMPT_TIMEOUT_MS}ms (503 high demand)`)), ATTEMPT_TIMEOUT_MS)),
+      ]);
+
+    const tries =
+      fallbackModel && fallbackModel !== primaryModel ? [primaryModel, fallbackModel, primaryModel] : [primaryModel, primaryModel];
+    let lastErr = null;
+    let geminiRes = null;
+    for (let i = 0; i < tries.length; i++) {
+      try {
+        geminiRes = await withTimeout(ai.models.generateContent({ model: tries[i], contents: prompt, config: { systemInstruction } }));
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.error(`[Gemini] attempt ${i + 1} (${tries[i]}) failed:`, String(err.message || err).slice(0, 160));
+        if (!isBusy(err)) break;
+        await sleep(300);
       }
-      let clean = String(rawNumber).replace(/\D/g, "");
-      if (clean.length === 10) clean = "91" + clean;
-      jid = `${clean}@s.whatsapp.net`;
     }
+    if (lastErr) throw lastErr;
 
-    if (imageUrl) {
-      await s.sock.sendMessage(jid, { image: { url: imageUrl }, caption: msgText });
-    } else {
-      if (!msgText) {
-        return res.status(200).json({ success: false, error: "Message is required" });
+    replyText = (geminiRes.text || "").trim();
+    const geminiMs = Date.now() - T0;
+
+    if (replyText) {
+      await deliver(replyText);
+      await storeOutgoing(ctx, replyText, "ai_bot", `${showroomName} AI`);
+      bumpDaily(ctx.conversationId);
+
+      if (/प्रतिनिधी लवकरच संपर्क करेल/.test(replyText)) {
+        await ctx.convRef.set({ needsHuman: true, needsHumanAt: new Date().toISOString() }, { merge: true });
       }
-      await s.sock.sendMessage(jid, { text: msgText });
-    }
-    res.json({ success: true, message: "Message sent successfully" });
-  } catch (err) {
-    res.status(200).json({ success: false, error: err.message });
-  }
-};
-app.post("/send-message", handleSendMessage);
-app.post("/session/send", handleSendMessage);
-app.post("/session/send/:id", handleSendMessage);
-app.post("/api/send", handleSendMessage);
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, async () => {
-  console.log(`WhatsApp Gateway Server listening on port ${PORT}`);
-  // restart वर सर्व सेव्ह केलेली सत्रे पुन्हा सुरू कर
-  try {
-    let ids = [];
-    if (db) {
-      const refs = await db.collection(SESSIONS_COL).listDocuments();
-      ids = refs.map((r) => r.id).filter(validId);
-    } else if (fs.existsSync(AUTH_ROOT)) {
-      ids = fs.readdirSync(AUTH_ROOT, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && validId(d.name))
-        .map((d) => d.name);
+      // ग्राहकाची माहिती आपोआप लीडमध्ये (उत्तर गेल्यानंतर, उशीर न लावता)
+      if (process.env.LEAD_CAPTURE !== "off" && !/^\[.*\]$/.test(combinedText.trim())) {
+        const extractModel = process.env.GEMINI_EXTRACT_MODEL || fallbackModel || primaryModel;
+        captureLead(db, ctx, ai, extractModel, historyText, combinedText);
+      }
     }
-    console.log(`Restoring ${ids.length} session(s)`);
-    ids.forEach((id, i) => setTimeout(() => startWhatsApp(id), 2000 * (i + 1)));
-  } catch (e) {
-    console.error("restore error:", e.message);
+    console.log(`[timing] showroom=${showroomId} gemini-done=${geminiMs}ms total=${Date.now() - T0}ms`);
+  } catch (geminiErr) {
+    console.error("[Gemini Auto-Reply Error]:", geminiErr.message);
+    if (process.env.GEMINI_FAILURE_REPLY !== "off") {
+      replyText = process.env.GEMINI_FAILURE_REPLY || "आमचा प्रतिनिधी लवकरच संपर्क करेल";
+      await deliver(replyText);
+      try {
+        await storeOutgoing(ctx, replyText, "ai_bot", "Auto-reply");
+        await ctx.convRef.set({ needsHuman: true, needsHumanAt: new Date().toISOString() }, { merge: true });
+      } catch (e) {
+        console.error("[storeOutgoing]", e.message);
+      }
+    }
   }
-});
+
+  return { success: true, conversationId: ctx.conversationId, leadId: ctx.leadId, replyText, replySent };
+}
+
+// जुन्या पद्धतीसाठी (एक मेसेज = एक उत्तर)
+async function handleIncoming(db, showroomId, from, jid, isLid, text, name, sendReply, onThinking) {
+  const ctx = await saveIncoming(db, showroomId, from, jid, isLid, text, name, { type: "text" });
+  return generateReply(db, ctx, text, new Set([ctx.messageId]), sendReply, onThinking);
+}
+
+module.exports = { handleIncoming, saveIncoming, generateReply };
