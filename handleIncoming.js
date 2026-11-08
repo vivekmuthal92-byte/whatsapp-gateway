@@ -397,23 +397,45 @@ async function generateReply(db, ctx, combinedText, excludeIds, sendReply, onThi
     const mapsLink = showroomData.googleMapsLink || showroomData.mapsLink || showroomData.mapUrl || showroomData.locationUrl || "";
     const customPrompt = aiConfig.customInstructions || aiConfig.systemPrompt || "";
 
-    // आधीचे संभाषण (संदर्भासाठी)
+    // आधीचे संभाषण (संदर्भासाठी). जुन्या मेसेजमध्ये timestamp स्ट्रिंग असू शकते आणि नवीनात Timestamp, म्हणून दोन्ही प्रकार वाचून वेळेनुसार लावतो
     let historyText = "";
     let hadAssistantBefore = false;
+    let lastAssistantText = "";
+    let lastAssistantMs = 0;
     try {
-      const hSnap = await ctx.convRef.collection("messages").orderBy("timestamp", "desc").limit(14).get();
+      const toMs = (d) => {
+        const t = d.timestamp;
+        if (t && typeof t.toMillis === "function") return t.toMillis();
+        if (typeof t === "string") { const n = Date.parse(t); if (!isNaN(n)) return n; }
+        if (d.createdAt) { const n = Date.parse(d.createdAt); if (!isNaN(n)) return n; }
+        return 0;
+      };
+      const msgsRef = ctx.convRef.collection("messages");
+      const [tsSnap, strSnap] = await Promise.all([
+        msgsRef.where("timestamp", ">", admin.firestore.Timestamp.fromMillis(0)).orderBy("timestamp", "desc").limit(12).get().catch(() => null),
+        msgsRef.where("timestamp", ">", "").orderBy("timestamp", "desc").limit(12).get().catch(() => null),
+      ]);
+      const all = [];
+      [tsSnap, strSnap].forEach((sn) => sn && sn.forEach((h) => all.push(h.data() || {})));
+      all.sort((x, y) => toMs(y) - toMs(x));
       const rows = [];
-      hSnap.forEach((h) => {
-        const d = h.data() || {};
-        if (exclude.has(d.messageId) || exclude.has(d.id)) return;
+      for (const d of all) {
+        if (exclude.has(d.messageId) || exclude.has(d.id)) continue;
         const t = String(d.text || d.content || "").trim();
-        if (t && rows.length < 8) rows.push((d.direction === "incoming" ? "ग्राहक: " : "सहाय्यक: ") + t);
-        if (t && d.direction !== "incoming") hadAssistantBefore = true;
-      });
+        if (!t) continue;
+        if (rows.length < 8) rows.push((d.direction === "incoming" ? "ग्राहक: " : "सहाय्यक: ") + t);
+        if (d.direction !== "incoming" && !lastAssistantMs) {
+          lastAssistantMs = toMs(d) || Date.now();
+          lastAssistantText = t;
+        }
+      }
       historyText = rows.reverse().join("\n");
     } catch (hErr) {
       console.error("[History]", hErr.message);
     }
+    // शेवटचे उत्तर गेल्याला फार वेळ झाला असेल (उदा. दुसरा दिवस) तर पुन्हा नमस्कार चालेल
+    const greetGapMs = Number(process.env.GREETING_GAP_HOURS || 12) * 3600000;
+    hadAssistantBefore = lastAssistantMs > 0 && Date.now() - lastAssistantMs < greetGapMs;
 
     const firstReplyNote = hadAssistantBefore
       ? "यापूर्वी उत्तरे दिलेली आहेत, म्हणून नमस्कार किंवा शोरूमची ओळख अजिबात देऊ नकोस. थेट उत्तर दे."
@@ -433,7 +455,9 @@ async function generateReply(db, ctx, combinedText, excludeIds, sendReply, onThi
 10. शक्य असेल तेव्हा उत्तराच्या शेवटी एक छोटा पुढचा प्रश्न विचार (उदा. कोणते मॉडेल हवे, बजेट किती, टेस्ट ड्राइव्ह बुक करू का). एका वेळी फक्त एकच प्रश्न.
 11. उत्तर लहान ठेव (१ ते ३ ओळी). इमोजी फार वापरू नकोस.
 12. ग्राहकाचा संदेश [फोटो], [व्हॉइस मेसेज], [व्हिडिओ], [दस्तऐवज] किंवा [लोकेशन] असा असेल तर सांग की तुला तो पाहता येत नाही, पण प्रतिनिधी पाहून कळवेल, आणि ग्राहकाला काय हवे ते मजकुरात लिहायला सांग.
-13. ग्राहकाने एकापेक्षा जास्त संदेश पाठवले असतील तर सर्वांचे मिळून एकच उत्तर दे.${customPrompt ? `\n14. शोरूमची विशेष सूचना: ${customPrompt}` : ""}`;
+13. ग्राहकाने एकापेक्षा जास्त संदेश पाठवले असतील तर सर्वांचे मिळून एकच उत्तर दे.
+14. "इतर काही मदत हवी आहे का?" असा सामान्य प्रश्न वारंवार विचारू नकोस. ग्राहक "हो" किंवा "नाही" म्हणाला तर तुझ्या मागच्या प्रश्नाचा संदर्भ घे. "नाही" असेल तर नम्रपणे निरोप घे किंवा एखादा उपयुक्त पर्याय (किंमत, ऑफर, फायनान्स, एक्सचेंज) सुचव. "हो" असेल पण नेमके काय हवे ते स्पष्ट नसेल तर विचार: "कोणती माहिती हवी आहे: किंमत, ऑफर, फायनान्स की टेस्ट ड्राइव्ह?"
+15. तुझे मागचे उत्तर पुन्हा तसेच किंवा त्याच शब्दांत देऊ नकोस.${customPrompt ? `\n16. शोरूमची विशेष सूचना: ${customPrompt}` : ""}`;
 
     const prompt = `=== शोरूम माहिती ===
 शोरूम: ${showroomName}
@@ -479,6 +503,23 @@ ${combinedText}
     if (lastErr) throw lastErr;
 
     replyText = (geminiRes.text || "").trim();
+    // मागच्या उत्तरासारखेच उत्तर आले तर एकदा वेगळे उत्तर मागवा
+    const normTxt = (x) => String(x || "").replace(/\s+/g, " ").trim();
+    if (replyText && lastAssistantText && normTxt(replyText) === normTxt(lastAssistantText)) {
+      try {
+        const res2 = await withTimeout(
+          ai.models.generateContent({
+            model: primaryModel,
+            contents: prompt + "\n\nटीप: तुझे मागचे उत्तर नेमके हेच होते. वेगळे, उपयुक्त आणि अधिक विशिष्ट उत्तर दे. ग्राहकाला नेमके काय हवे (किंमत, ऑफर, फायनान्स, एक्सचेंज, टेस्ट ड्राइव्ह) ते विचार.",
+            config: { systemInstruction },
+          })
+        );
+        const t2 = (res2.text || "").trim();
+        if (t2 && normTxt(t2) !== normTxt(lastAssistantText)) replyText = t2;
+      } catch (e) {
+        console.error("[Gemini repeat-guard]", e.message);
+      }
+    }
     const geminiMs = Date.now() - T0;
 
     if (replyText) {
